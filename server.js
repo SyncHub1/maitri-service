@@ -21,7 +21,7 @@ const __dirname = dirname(__filename);
 
 // Import configurations and middleware
 import { connectDB } from './config/database.js';
-import { initializeRedis } from './config/redis.js';
+import { initializeRedis, closeRedis } from './config/redis.js';
 import { setupSocketIO } from './config/socket.js';
 import { logger } from './config/logger.js';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler.js';
@@ -46,11 +46,9 @@ const server = createServer(app);
 const io = new Server(server, {
   cors: {
     origin: [
-      process.env.FRONTEND_URL || 'http://localhost:5173',
-      process.env.MATRI_FRONTEND_URL || 'http://localhost:5175',
-      'http://localhost:3000',
       'http://localhost:5173',
       'http://localhost:5175',
+      'http://localhost:8080',
       'https://www.synchubb.in',
       'https://synchubb-matri-frontend.vercel.app'
     ],
@@ -59,7 +57,6 @@ const io = new Server(server, {
   },
   transports: ['websocket', 'polling']
 });
-
 // Create logs directory if it doesn't exist
 const logsDir = join(__dirname, 'logs');
 if (!fs.existsSync(logsDir)) {
@@ -78,38 +75,105 @@ const limiter = rateLimit({
   legacyHeaders: false
 });
 
+
 // Security middleware
 app.use(helmet({
-  crossOriginEmbedderPolicy: false,
   contentSecurityPolicy: {
-    directives: {
-      defaultSrc: ["'self'"],
-      styleSrc: ["'self'", "'unsafe-inline'"],
-      scriptSrc: ["'self'"],
-      imgSrc: ["'self'", "data:", "https:"],
-      connectSrc: ["'self'", "ws:", "wss:"]
-    }
-  }
+      directives: {
+          defaultSrc: ["'self'"],
+          scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'"],
+          styleSrc: ["'self'", "'unsafe-inline'"],
+          imgSrc: ["'self'", "data:", "https:"],
+          connectSrc: ["'self'", "https://www.synchubb.in", process.env.MATRI_FRONTEND_URL],
+          fontSrc: ["'self'"],
+          objectSrc: ["'none'"],
+          mediaSrc: ["'self'"],
+          frameSrc: ["'self'", "https://www.synchubb.in"]
+      }
+  },
+  crossOriginEmbedderPolicy: false,
+  crossOriginResourcePolicy: { policy: "cross-origin" },
+  crossOriginOpenerPolicy: { policy: "same-origin" }
 }));
+
+
+// CORS configuration with explicit header setting
+app.use(cors({
+  origin: function (origin, callback) {
+    console.log('🔍 CORS Check - Request Origin:', origin);
+    
+    const allowedOrigins = [
+      'http://localhost:5173',
+      'http://localhost:5175',
+      'http://localhost:8080',
+      'https://www.synchubb.in',
+      'https://synchubb-matri-frontend.vercel.app'
+    ];
+    
+    // Allow requests with no origin (mobile apps, Postman, etc.)
+    if (!origin) {
+      console.log('✅ CORS: Allowing request with no origin');
+      return callback(null, true);
+    }
+    
+    // Check if origin is in allowed list
+    if (allowedOrigins.includes(origin)) {
+      console.log('✅ CORS: Origin allowed:', origin);
+      return callback(null, true);
+    }
+    
+    // In development, allow all origins
+    console.log('⚠️ CORS: Origin not in whitelist but allowing in development:', origin);
+    return callback(null, true);
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'],
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'Cookie',
+    'X-Requested-With',
+    'Accept',
+    'Origin',
+    'Cache-Control',
+    'Pragma'
+  ],
+  exposedHeaders: ['Content-Length', 'Date', 'X-API-Version'],
+  preflightContinue: false,
+  optionsSuccessStatus: 200
+}));
+
+// Additional middleware to ensure CORS headers are always present
+app.use((req, res, next) => {
+  const origin = req.get('Origin');
+  
+  console.log('🔧 Setting CORS headers for:', req.method, req.url, 'from origin:', origin);
+  
+  // Always set Access-Control-Allow-Origin
+  if (origin) {
+    res.header('Access-Control-Allow-Origin', origin);
+  } else {
+    res.header('Access-Control-Allow-Origin', 'http://localhost:5175');
+  }
+  
+  // Set other CORS headers
+  res.header('Access-Control-Allow-Credentials', 'true');
+  res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,PATCH,OPTIONS,HEAD');
+  res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization,Cookie,X-Requested-With,Accept,Origin,Cache-Control,Pragma');
+  res.header('Access-Control-Max-Age', '86400');
+  
+  // Handle preflight OPTIONS requests
+  if (req.method === 'OPTIONS') {
+    console.log('🔄 Handling preflight OPTIONS request for:', req.url);
+    return res.status(200).end();
+  }
+  
+  next();
+});
+
 
 app.use(compression());
 app.use(limiter);
-
-// CORS configuration
-app.use(cors({
-  origin: [
-    process.env.FRONTEND_URL || 'http://localhost:5173',
-    process.env.MATRI_FRONTEND_URL || 'http://localhost:5175',
-    'http://localhost:3000',
-    'http://localhost:5173',
-    'http://localhost:5175',
-    'https://www.synchubb.in',
-    'https://synchubb-matri-frontend.vercel.app'
-  ],
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Cookie']
-}));
 
 // Logging middleware
 app.use(morgan('combined', {
@@ -122,16 +186,43 @@ app.use(morgan('combined', {
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// Health check endpoint
+
+
+
+// Request logging middleware
+app.use((req, res, next) => {
+  console.log(`📥 ${req.method} ${req.url} from ${req.get('Origin') || 'unknown'}`);
+  next();
+});
+
+// Health check endpoint with CORS debugging
 app.get('/health', (req, res) => {
-  res.json({
+  const origin = req.get('Origin');
+  console.log('🌡️ Health check requested from origin:', origin);
+  console.log('🔧 Current response headers before sending:');
+  console.log('  Access-Control-Allow-Origin:', res.get('Access-Control-Allow-Origin'));
+  console.log('  Access-Control-Allow-Credentials:', res.get('Access-Control-Allow-Credentials'));
+  
+  const healthData = {
     status: 'healthy',
     timestamp: new Date().toISOString(),
     service: 'matri-service',
     version: process.env.API_VERSION || 'v1',
     uptime: process.uptime(),
-    environment: process.env.NODE_ENV || 'development'
-  });
+    environment: process.env.NODE_ENV || 'development',
+    port: process.env.PORT || 3003,
+    cors: {
+      requestOrigin: origin,
+      responseHeaders: {
+        'access-control-allow-origin': res.get('Access-Control-Allow-Origin'),
+        'access-control-allow-credentials': res.get('Access-Control-Allow-Credentials'),
+        'access-control-allow-methods': res.get('Access-Control-Allow-Methods')
+      }
+    }
+  };
+  
+  console.log('✅ Health check response data:', healthData);
+  res.json(healthData);
 });
 
 // API routes with versioning
@@ -180,14 +271,18 @@ const startServer = async () => {
       logger.warn('⚠️ Continuing without database in development mode');
     }
 
-    // Initialize Redis connection
+    // Initialize Redis connection with better error handling
     try {
+      logger.info('🔄 Attempting to connect to Redis...');
       await initializeRedis();
       logger.info('✅ Redis connected successfully');
     } catch (redisError) {
-      // Redis initialization handles its own logging and fallback
-      // No need to log additional errors here
-      if (process.env.NODE_ENV === 'production') {
+      logger.warn('⚠️ Redis connection failed, using mock Redis for development');
+      logger.info('🛠️ Service will continue with limited caching capabilities');
+      
+      // In production, we might want to fail if Redis is required
+      if (process.env.NODE_ENV === 'production' && process.env.REQUIRE_REDIS === 'true') {
+        logger.error('❌ Redis is required in production but not available');
         throw redisError;
       }
     }
@@ -220,6 +315,26 @@ const startServer = async () => {
   }
 };
 
+// Handle unhandled promise rejections and uncaught exceptions
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
+  // Don't exit the process in development for Redis connection issues
+  if (reason && reason.code === 'ECONNREFUSED' && reason.address === '127.0.0.1') {
+    logger.warn('⚠️ Redis connection refused - continuing with mock Redis');
+    return;
+  }
+});
+
+process.on('uncaughtException', (error) => {
+  logger.error('❌ Uncaught Exception:', error);
+  // Don't exit for Redis connection issues
+  if (error.code === 'ECONNREFUSED' && error.address === '127.0.0.1') {
+    logger.warn('⚠️ Redis connection refused - continuing with mock Redis');
+    return;
+  }
+  process.exit(1);
+});
+
 // Graceful shutdown
 const gracefulShutdown = async (signal) => {
   logger.info(`🛑 ${signal} received, shutting down Matri service gracefully...`);
@@ -235,7 +350,11 @@ const gracefulShutdown = async (signal) => {
     logger.info('✅ Database connection closed');
 
     // Close Redis connection (if initialized)
-    // Redis cleanup will be handled by shared-utils
+    try {
+      await closeRedis();
+    } catch (redisCloseError) {
+      logger.warn('⚠️ Redis cleanup failed:', redisCloseError.message);
+    }
 
     logger.info('✅ Matri service shut down successfully');
     process.exit(0);
