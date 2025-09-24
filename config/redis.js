@@ -25,45 +25,70 @@ const initializeRedis = async () => {
   try {
     logger.info('🔄 Initializing Redis connections...');
     
+    // First, test if Redis is available with a simple connection test
+    const testClient = new Redis({
+      ...redisConfig,
+      retryDelayOnFailover: 0,
+      maxRetriesPerRequest: 1,
+      connectTimeout: 2000,
+      lazyConnect: true,
+      enableOfflineQueue: false,
+      enableReadyCheck: false,
+      maxRetriesPerRequest: null
+    });
+    
+    // Test connection with timeout
+    try {
+      await Promise.race([
+        testClient.ping(),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Redis connection timeout')), 2000)
+        )
+      ]);
+      
+      // If we get here, Redis is available
+      await testClient.quit();
+      logger.info('✅ Redis server is available, creating connections...');
+      
+    } catch (testError) {
+      await testClient.disconnect();
+      throw testError;
+    }
+    
     // Main Redis client for general operations
     redisClient = new Redis({
       ...redisConfig,
       retryDelayOnFailover: 100,
-      maxRetriesPerRequest: 0, // No retries for faster failure
-      connectTimeout: 3000, // Reduce timeout further
-      lazyConnect: true, // Don't connect immediately
-      enableOfflineQueue: false // Don't queue commands when offline
+      maxRetriesPerRequest: 3,
+      connectTimeout: 5000,
+      lazyConnect: false,
+      enableOfflineQueue: false
     });
     
     // Separate clients for pub/sub to avoid blocking
     redisSubscriber = new Redis({
       ...redisConfig,
       retryDelayOnFailover: 100,
-      maxRetriesPerRequest: 0,
-      connectTimeout: 3000,
-      lazyConnect: true,
+      maxRetriesPerRequest: 3,
+      connectTimeout: 5000,
+      lazyConnect: false,
       enableOfflineQueue: false
     });
     
     redisPublisher = new Redis({
       ...redisConfig,
       retryDelayOnFailover: 100,
-      maxRetriesPerRequest: 0,
-      connectTimeout: 3000,
-      lazyConnect: true,
+      maxRetriesPerRequest: 3,
+      connectTimeout: 5000,
+      lazyConnect: false,
       enableOfflineQueue: false
     });
 
-    // Test connections with timeout
-    await Promise.race([
-      Promise.all([
-        redisClient.ping(),
-        redisSubscriber.ping(),
-        redisPublisher.ping()
-      ]),
-      new Promise((_, reject) => 
-        setTimeout(() => reject(new Error('Redis connection timeout')), 2000)
-      )
+    // Wait for all connections to be ready
+    await Promise.all([
+      new Promise((resolve) => redisClient.on('ready', resolve)),
+      new Promise((resolve) => redisSubscriber.on('ready', resolve)),
+      new Promise((resolve) => redisPublisher.on('ready', resolve))
     ]);
 
     // Event listeners for main client
@@ -76,7 +101,11 @@ const initializeRedis = async () => {
     });
 
     redisClient.on('error', (err) => {
-      logger.error('❌ Redis client error:', err);
+      if (err.code === 'ECONNREFUSED') {
+        logger.warn('⚠️ Redis client connection refused - using fallback mode');
+      } else {
+        logger.error('❌ Redis client error:', err.message);
+      }
     });
 
     redisClient.on('close', () => {
@@ -93,7 +122,9 @@ const initializeRedis = async () => {
     });
 
     redisSubscriber.on('error', (err) => {
-      logger.error('❌ Redis subscriber error:', err);
+      if (err.code !== 'ECONNREFUSED') {
+        logger.error('❌ Redis subscriber error:', err.message);
+      }
     });
 
     // Event listeners for publisher
@@ -102,7 +133,9 @@ const initializeRedis = async () => {
     });
 
     redisPublisher.on('error', (err) => {
-      logger.error('❌ Redis publisher error:', err);
+      if (err.code !== 'ECONNREFUSED') {
+        logger.error('❌ Redis publisher error:', err.message);
+      }
     });
 
     logger.info('✅ All Redis connections initialized successfully');
@@ -117,8 +150,8 @@ const initializeRedis = async () => {
       logger.warn('🔄 Using mock Redis service for development');
     }
     
-    // Create mock Redis clients
-    const mockRedis = {
+    // Create mock Redis clients that don't attempt connections
+    const createMockRedis = () => ({
       ping: async () => 'PONG',
       get: async () => null,
       set: async () => 'OK',
@@ -131,13 +164,20 @@ const initializeRedis = async () => {
       subscribe: async () => {},
       unsubscribe: async () => {},
       quit: async () => 'OK',
+      disconnect: async () => 'OK',
+      info: async () => 'redis_version:mock\r\nuptime_in_seconds:0',
       pipeline: () => ({
         setex: () => mockRedis.pipeline(),
         set: () => mockRedis.pipeline(),
         exec: async () => []
       }),
-      on: () => {}
-    };
+      on: () => {},
+      off: () => {},
+      removeAllListeners: () => {},
+      status: 'ready'
+    });
+    
+    const mockRedis = createMockRedis();
     
     redisClient = mockRedis;
     redisSubscriber = mockRedis;

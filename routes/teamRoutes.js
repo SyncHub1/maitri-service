@@ -10,6 +10,16 @@ import { v4 as uuidv4 } from 'uuid';
 
 const router = express.Router();
 
+// Test endpoint to verify API is working
+router.get('/test', (req, res) => {
+  res.json({
+    success: true,
+    message: 'Teams API is working',
+    timestamp: new Date().toISOString(),
+    endpoint: '/api/v1/teams/test'
+  });
+});
+
 // Validation rules
 const createTeamValidation = [
   body('name')
@@ -676,6 +686,378 @@ router.delete('/:teamId/members/:memberId',
       success: true,
       message: 'Member removed successfully'
     });
+  })
+);
+
+// GET /teams - Get all teams with filtering and pagination (no auth required for public teams)
+router.get('/', 
+  [
+    query('page').optional().isInt({ min: 1 }).withMessage('Page must be a positive integer'),
+    query('limit').optional().isInt({ min: 1, max: 100 }).withMessage('Limit must be between 1 and 100'),
+    query('search').optional().trim().isLength({ max: 100 }).withMessage('Search query too long'),
+    query('category').optional().isIn(['Web Development', 'Mobile Apps', 'AI/ML', 'Blockchain', 'IoT', 'Game Development', 'Design', 'Data Science', 'DevOps', 'Cybersecurity', 'Other']),
+    query('visibility').optional().isIn(['public', 'private', 'invite-only']),
+    query('sortBy').optional().isIn(['name', 'createdAt', 'memberCount', 'updatedAt']),
+    query('sortOrder').optional().isIn(['asc', 'desc'])
+  ],
+  asyncHandler(async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      throw createValidationError(errors.array());
+    }
+
+    const {
+      page = 1,
+      limit = 20,
+      search,
+      category,
+      visibility = 'public',
+      sortBy = 'createdAt',
+      sortOrder = 'desc'
+    } = req.query;
+
+    const skip = (page - 1) * limit;
+    const sort = { [sortBy]: sortOrder === 'desc' ? -1 : 1 };
+
+    // Build query
+    const query = { visibility };
+    
+    if (search) {
+      query.$or = [
+        { name: { $regex: search, $options: 'i' } },
+        { description: { $regex: search, $options: 'i' } }
+      ];
+    }
+    
+    if (category) {
+      query.category = category;
+    }
+
+    try {
+      // Check if database is connected
+      const mongoose = await import('mongoose');
+      if (mongoose.default.connection.readyState !== 1) {
+        logger.warn('Database not connected, returning mock data');
+        // Return mock data for testing
+        const mockTeams = [
+          {
+            id: 'mock-team-1',
+            name: 'React Developers',
+            description: 'Building awesome React applications',
+            category: 'Web Development',
+            visibility: 'public',
+            memberCount: 5,
+            maxMembers: 10,
+            skills: ['React', 'JavaScript', 'TypeScript'],
+            location: 'Remote',
+            createdAt: new Date(),
+            updatedAt: new Date(),
+            owner: { username: 'john_doe', email: 'john@example.com' },
+            members: []
+          },
+          {
+            id: 'mock-team-2',
+            name: 'AI/ML Enthusiasts',
+            description: 'Exploring machine learning and AI',
+            category: 'AI/ML',
+            visibility: 'public',
+            memberCount: 3,
+            maxMembers: 8,
+            skills: ['Python', 'TensorFlow', 'PyTorch'],
+            location: 'San Francisco',
+            createdAt: new Date(),
+            updatedAt: new Date(),
+            owner: { username: 'jane_smith', email: 'jane@example.com' },
+            members: []
+          }
+        ];
+
+        return res.json({
+          success: true,
+          data: mockTeams,
+          pagination: {
+            page: parseInt(page),
+            limit: parseInt(limit),
+            total: mockTeams.length,
+            pages: 1
+          },
+          note: 'Mock data - database not connected'
+        });
+      }
+
+      const [teams, total] = await Promise.all([
+        Team.find(query)
+          .sort(sort)
+          .skip(skip)
+          .limit(parseInt(limit))
+          .populate('owner', 'username email avatar')
+          .populate('members.user', 'username email avatar')
+          .lean(),
+        Team.countDocuments(query)
+      ]);
+
+      // Transform teams data
+      const transformedTeams = teams.map(team => ({
+        id: team._id,
+        name: team.name,
+        description: team.description,
+        category: team.category,
+        visibility: team.visibility,
+        memberCount: team.members?.length || 0,
+        maxMembers: team.maxMembers,
+        skills: team.skills,
+        location: team.location,
+        createdAt: team.createdAt,
+        updatedAt: team.updatedAt,
+        owner: team.owner,
+        members: team.members?.slice(0, 5) // Show first 5 members
+      }));
+
+      res.json({
+        success: true,
+        data: transformedTeams,
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(limit),
+          total,
+          pages: Math.ceil(total / limit)
+        }
+      });
+    } catch (error) {
+      logger.error('Error fetching teams:', error);
+      
+      // Return mock data as fallback
+      const mockTeams = [
+        {
+          id: 'fallback-team-1',
+          name: 'Sample Team',
+          description: 'This is a sample team for testing',
+          category: 'Web Development',
+          visibility: 'public',
+          memberCount: 1,
+          maxMembers: 5,
+          skills: ['JavaScript', 'React'],
+          location: 'Remote',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          owner: { username: 'test_user', email: 'test@example.com' },
+          members: []
+        }
+      ];
+
+      res.json({
+        success: true,
+        data: mockTeams,
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(limit),
+          total: mockTeams.length,
+          pages: 1
+        },
+        note: 'Fallback data - database error',
+        error: error.message
+      });
+    }
+  })
+);
+
+// POST /teams - Create a new team
+router.post('/',
+  authMiddleware,
+  createTeamValidation,
+  asyncHandler(async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      throw createValidationError(errors.array());
+    }
+
+    const userId = req.user.id;
+    const {
+      name,
+      description,
+      category,
+      visibility = 'public',
+      maxMembers = 10,
+      location,
+      skills = [],
+      lookingFor = []
+    } = req.body;
+
+    try {
+      const team = new Team({
+        name,
+        description,
+        category,
+        visibility,
+        maxMembers,
+        location,
+        skills,
+        lookingFor,
+        owner: userId,
+        members: [{
+          user: userId,
+          role: 'owner',
+          joinedAt: new Date()
+        }]
+      });
+
+      await team.save();
+      await team.populate('owner', 'username email avatar');
+      await team.populate('members.user', 'username email avatar');
+
+      logHelpers.logTeam('created', team._id, userId, {
+        name: team.name,
+        category: team.category
+      });
+
+      res.status(201).json({
+        success: true,
+        message: 'Team created successfully',
+        data: {
+          id: team._id,
+          name: team.name,
+          description: team.description,
+          category: team.category,
+          visibility: team.visibility,
+          memberCount: team.members.length,
+          maxMembers: team.maxMembers,
+          owner: team.owner,
+          members: team.members
+        }
+      });
+    } catch (error) {
+      logger.error('Error creating team:', error);
+      res.status(500).json({
+        success: false,
+        message: 'Failed to create team',
+        error: error.message
+      });
+    }
+  })
+);
+
+// GET /teams/:id - Get team by ID
+router.get('/:id',
+  param('id').isMongoId().withMessage('Invalid team ID'),
+  asyncHandler(async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      throw createValidationError(errors.array());
+    }
+
+    const { id } = req.params;
+
+    try {
+      const team = await Team.findById(id)
+        .populate('owner', 'username email avatar')
+        .populate('members.user', 'username email avatar')
+        .lean();
+
+      if (!team) {
+        return res.status(404).json({
+          success: false,
+          message: 'Team not found'
+        });
+      }
+
+      res.json({
+        success: true,
+        data: {
+          id: team._id,
+          name: team.name,
+          description: team.description,
+          category: team.category,
+          visibility: team.visibility,
+          memberCount: team.members?.length || 0,
+          maxMembers: team.maxMembers,
+          skills: team.skills,
+          location: team.location,
+          lookingFor: team.lookingFor,
+          createdAt: team.createdAt,
+          updatedAt: team.updatedAt,
+          owner: team.owner,
+          members: team.members
+        }
+      });
+    } catch (error) {
+      logger.error('Error fetching team:', error);
+      res.status(500).json({
+        success: false,
+        message: 'Failed to fetch team',
+        error: error.message
+      });
+    }
+  })
+);
+
+// POST /teams/:id/join - Join a team
+router.post('/:id/join',
+  authMiddleware,
+  param('id').isMongoId().withMessage('Invalid team ID'),
+  asyncHandler(async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      throw createValidationError(errors.array());
+    }
+
+    const { id: teamId } = req.params;
+    const userId = req.user.id;
+
+    try {
+      const team = await Team.findById(teamId);
+      if (!team) {
+        return res.status(404).json({
+          success: false,
+          message: 'Team not found'
+        });
+      }
+
+      // Check if user is already a member
+      const isMember = team.members.some(member => member.user.toString() === userId);
+      if (isMember) {
+        return res.status(400).json({
+          success: false,
+          message: 'You are already a member of this team'
+        });
+      }
+
+      // Check if team is full
+      if (team.members.length >= team.maxMembers) {
+        return res.status(400).json({
+          success: false,
+          message: 'Team is full'
+        });
+      }
+
+      // Add user to team
+      team.members.push({
+        user: userId,
+        role: 'member',
+        joinedAt: new Date()
+      });
+
+      await team.save();
+
+      logHelpers.logTeam('member_joined', teamId, userId, {
+        memberCount: team.members.length
+      });
+
+      res.json({
+        success: true,
+        message: 'Successfully joined the team',
+        data: {
+          teamId: team._id,
+          memberCount: team.members.length
+        }
+      });
+    } catch (error) {
+      logger.error('Error joining team:', error);
+      res.status(500).json({
+        success: false,
+        message: 'Failed to join team',
+        error: error.message
+      });
+    }
   })
 );
 
